@@ -2,67 +2,78 @@
 # -*- coding: utf-8 -*-
 """
 主程式: 使用 Pygame 載入 map.json，呈現 16x7 地圖背景並繪製動態角色
-並在畫面下方新增輸入區與綠色 Send 按鈕，供未來 LLM 串接使用
-支持繁體中文注音輸入 (IME)
-
-若要自訂字體，可透過設定 FONT_PATH 或 FONT_NAME
+並在畫面下方新增輸入區與綠色 Send 按鈕，實作 LLM 串接：
+- 過濾空訊息
+- 從 prompt.txt 載入提示詞
+- 呼叫 OpenAI API (v1介面) 並解析 JSON
+- 自動執行移動或輸出對話
+支持繁體中文注音輸入 (IME)。
 """
 import pygame
 import json
 import os
 import collections
+import re
+import openai
 
-# 平滑移動設定
-MOVE_SPEED = 200       # 像素/秒
-ANIM_INTERVAL = 0.02   # 動畫切換間隔 (秒)
-IDLE_DELAY = 0.8       # 停止移動後切回待機貼圖延遲 (秒)
-LAVA_TILE = "200"     # 岩漿物件編號
+# 載入 Prompt
+with open("prompt.txt", "r", encoding="utf-8") as pf:
+    PROMPT_TEMPLATE = pf.read().strip()
+# API 設定: 使用 openai-python v1 客戶端
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MODEL = "gpt-4o"
 
-# 鍵位對應方向
-KEY_DIR_MAP = {
-    pygame.K_w: (0, 1),
-    pygame.K_s: (0, -1),
-    pygame.K_a: (-1, 0),
-    pygame.K_d: (1, 0),
-}
-
-# 玩家貼圖編號與動畫貼圖
+# 移動設定
+ENABLE_MOVEMENT = True  # 控制是否允許 WASD 或 AI 指令移動
+MOVE_SPEED = 200
+ANIM_INTERVAL = 0.02
+IDLE_DELAY = 0.8
+LAVA_TILE = "200"
+# 玩家動畫定義
 IDLE_TILE = "300"
-ANIM_TILES = {
-    (0, 1): ["310", "311"],
-    (1, 0): ["320", "321"],
-    (-1, 0): ["330", "331"],
-    (0, -1): ["340", "341"],
-}
-
-# 禁用鍵位映射
-DISABLE_KEY = {
-    'left': pygame.K_d,
-    'right': pygame.K_a,
-    'top': pygame.K_s,
-    'bottom': pygame.K_w,
-}
+ANIM_TILES = {(0,1):["310","311"], (1,0):["320","321"], (-1,0):["330","331"], (0,-1):["340","341"]}
+# 鍵位對應方向
+KEY_DIR_MAP = {pygame.K_w:(0,1), pygame.K_s:(0,-1), pygame.K_a:(-1,0), pygame.K_d:(1,0)}
+# lava_block 禁用鍵位
+DISABLE_KEY = {'left':pygame.K_d,'right':pygame.K_a,'top':pygame.K_s,'bottom':pygame.K_w}
 
 # UI 參數
 UI_HEIGHT = 100
 FONT_SIZE = 24
-# 如有 .ttf 字型檔，可放在專案根目錄並指定路徑
-FONT_PATH = "font/Cubic_11.ttf"  # 或 None
-# 如想使用系統字型，填入字型名稱，如 "Microsoft JhengHei"
+FONT_PATH = "font/Cubic_11.ttf"
 FONT_NAME = None
 INPUT_PADDING = 10
 BUTTON_WIDTH = 100
 BUTTON_HEIGHT = 40
-BUTTON_COLOR = (0, 200, 0)
-BUTTON_TEXT_COLOR = (255, 255, 255)
+BUTTON_COLOR = (0,200,0)
+BUTTON_TEXT_COLOR = (255,255,255)
+
+# 過濾空白或純標點
+IGNORE_RE = re.compile(r"^\s*$")
+
+# 呼叫 OpenAI 並解析 JSON
+def call_openai(user_input, position):
+    messages = [
+        {"role": "system", "content": PROMPT_TEMPLATE},
+        {"role": "user", "content": f"{{\"x\":{position['x']},\"y\":{position['y']}}} {user_input}"}
+    ]
+    resp = client.chat.completions.create(model=MODEL, messages=messages)
+    text = resp.choices[0].message.content.strip()
+    # 移除 Markdown code fences
+    text = re.sub(r"```(?:json)?", "", text)
+    text = text.replace("```", "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"mode": "error", "content": text}
 
 
 def main():
     pygame.init()
-    pygame.key.set_repeat(200, 150)
+    pygame.key.set_repeat(200,150)
     pygame.key.start_text_input()
 
-    # 字體載入：優先使用 FONT_PATH，其次使用 FONT_NAME，否則預設
+    # 載入字體
     if FONT_PATH and os.path.exists(FONT_PATH):
         font = pygame.font.Font(FONT_PATH, FONT_SIZE)
     elif FONT_NAME:
@@ -70,30 +81,22 @@ def main():
     else:
         font = pygame.font.Font(None, FONT_SIZE)
 
-    # 讀取地圖 JSON
+    # 讀取 map.json
     with open("map.json", "r", encoding="utf-8") as f:
         data = json.load(f)
     background = data.get("background", [])
     objects = data.get("objects", [])
     lava_block = data.get("lava_block", {})
+    cols, rows = len(background[0]), len(background)
 
-    # 解析 lava_block
-    block_sets = {side: {(c['x'], c['y']) for c in lava_block.get(side, [])}
-                   for side in ['left','right','top','bottom']}
-
-    # 地圖尺寸
-    ORIGINAL_TILE = 500
-    cols = len(background[0]); rows = len(background)
-    game_w = cols * ORIGINAL_TILE; game_h = rows * ORIGINAL_TILE
-    DESIRED_W = 800
-    scale = DESIRED_W / game_w
-    tile_size = int(ORIGINAL_TILE * scale)
-    screen_w = DESIRED_W; screen_h = int(game_h * scale) + UI_HEIGHT
-
+    # 初始化 pygame 視窗
+    screen_w = 800
+    tile_px = int(500 * (screen_w / (16*500)))
+    screen_h = rows * tile_px + UI_HEIGHT
     screen = pygame.display.set_mode((screen_w, screen_h))
-    pygame.display.set_caption("遊戲 + 注音輸入介面")
+    pygame.display.set_caption("遊戲 + LLM 輸入介面")
 
-    # 載入圖檔
+    # 載入圖像資源
     images = {}
     ids = set(sum(background, []))
     ids.update(o['type'] for o in objects)
@@ -101,35 +104,26 @@ def main():
     for frames in ANIM_TILES.values(): ids.update(frames)
     for tid in ids:
         img = pygame.image.load(os.path.join("images", f"{tid}.png")).convert_alpha()
-        images[tid] = pygame.transform.scale(img, (tile_size, tile_size))
-
+        images[tid] = pygame.transform.scale(img, (tile_px, tile_px))
     lava_pos = {(o['x'], o['y']) for o in objects if o['type'] == LAVA_TILE}
     object_pos = {(o['x'], o['y']) for o in objects}
 
-    # 玩家初始位置
+    # 玩家位置狀態
     tile_x, tile_y = 1, 2
-    px = tile_x * tile_size; py = (rows - 1 - tile_y) * tile_size
-    tgt_x, tgt_y = px, py; moving=False
-    last_dir=(0,0); anim_t=0; anim_i=0; idle_t=IDLE_DELAY
-    queue = collections.deque()
+    player_pos = {'x': tile_x, 'y': tile_y}
+    move_queue = collections.deque()
 
     # 輸入框與按鈕
     input_text = ''
-    input_rect = pygame.Rect(
-        INPUT_PADDING,
-        screen_h - UI_HEIGHT + INPUT_PADDING,
-        screen_w - 3*INPUT_PADDING - BUTTON_WIDTH,
-        BUTTON_HEIGHT
-    )
-    button_rect = pygame.Rect(
-        screen_w - INPUT_PADDING - BUTTON_WIDTH,
-        screen_h - UI_HEIGHT + (UI_HEIGHT - BUTTON_HEIGHT)//2,
-        BUTTON_WIDTH, BUTTON_HEIGHT
-    )
+    input_rect = pygame.Rect(INPUT_PADDING, screen_h-UI_HEIGHT+INPUT_PADDING,
+                              screen_w-3*INPUT_PADDING-BUTTON_WIDTH, BUTTON_HEIGHT)
+    button_rect = pygame.Rect(screen_w-INPUT_PADDING-BUTTON_WIDTH,
+                               screen_h-UI_HEIGHT+(UI_HEIGHT-BUTTON_HEIGHT)//2,
+                               BUTTON_WIDTH, BUTTON_HEIGHT)
 
-    clock = pygame.time.Clock(); running=True
+    clock = pygame.time.Clock()
+    running = True
     while running:
-        dt = clock.tick(60)/1000
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 running = False
@@ -140,62 +134,54 @@ def main():
                 if e.key == pygame.K_BACKSPACE:
                     input_text = input_text[:-1]
                 elif e.key == pygame.K_RETURN:
-                    print("送出:", input_text)
+                    # 按 Enter 送出
+                    if input_text.strip() and not IGNORE_RE.match(input_text):
+                        result = call_openai(input_text, player_pos)
+                        # 處理 move 或 talk
+                        if result.get("mode") == "move" and ENABLE_MOVEMENT:
+                            for step in result.get("steps", []):
+                                dx, dy = {"up":(0,1),"down":(0,-1),"left":(-1,0),"right":(1,0)}[step["dir"]]
+                                for _ in range(step.get("times",1)):
+                                    move_queue.append((dx, dy))
+                        elif result.get("mode") == "talk":
+                            print("NPC說：", result.get("content"))
+                        else:
+                            print("API 回傳：", result)
                     input_text = ''
-                elif e.key in KEY_DIR_MAP and not input_rect.collidepoint(pygame.mouse.get_pos()):
-                    pos = (tile_x, tile_y)
-                    disabled = any(
-                        pos in block_sets[side] and e.key == DISABLE_KEY[side]
-                        for side in block_sets
-                    )
-                    if not disabled:
-                        queue.append(KEY_DIR_MAP[e.key])
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 if button_rect.collidepoint(e.pos):
-                    print("Send 點擊:", input_text)
+                    # 按鈕送出同上
+                    if input_text.strip() and not IGNORE_RE.match(input_text):
+                        result = call_openai(input_text, player_pos)
+                        if result.get("mode") == "move" and ENABLE_MOVEMENT:
+                            for step in result.get("steps", []):
+                                dx, dy = {"up":(0,1),"down":(0,-1),"left":(-1,0),"right":(1,0)}[step["dir"]]
+                                for _ in range(step.get("times",1)):
+                                    move_queue.append((dx, dy))
+                        elif result.get("mode") == "talk":
+                            print("NPC說：", result.get("content"))
+                        else:
+                            print("API 回傳：", result)
                     input_text = ''
 
-        # 處理移動
-        if not moving and queue:
-            dx, dy = queue.popleft()
-            nx, ny = tile_x + dx, tile_y + dy
+        # 執行佇列移動
+        if ENABLE_MOVEMENT and move_queue:
+            dx, dy = move_queue.popleft()
+            nx, ny = player_pos['x']+dx, player_pos['y']+dy
             if 0 <= nx < cols and 0 <= ny < rows and (nx, ny) not in lava_pos:
-                tile_x, tile_y = nx, ny
-                tgt_x = tile_x * tile_size; tgt_y = (rows - 1 - tile_y) * tile_size
-                moving=True; last_dir=(dx,dy); anim_t=0; anim_i=0; idle_t=0
-        if moving:
-            diff_x, diff_y = tgt_x - px, tgt_y - py
-            px += max(-MOVE_SPEED*dt, min(MOVE_SPEED*dt, diff_x))
-            py += max(-MOVE_SPEED*dt, min(MOVE_SPEED*dt, diff_y))
-            if px == tgt_x and py == tgt_y: moving=False
+                player_pos['x'], player_pos['y'] = nx, ny
 
-        # 動畫更新
-        if moving:
-            anim_t += dt
-            if anim_t >= ANIM_INTERVAL:
-                anim_t -= ANIM_INTERVAL
-                frames = ANIM_TILES.get(last_dir, [])
-                anim_i = (anim_i + 1) % len(frames)
-            curr = ANIM_TILES.get(last_dir, [IDLE_TILE])[anim_i]
-            idle_t = 0
-        else:
-            idle_t += dt
-            if idle_t >= IDLE_DELAY:
-                curr = IDLE_TILE
-            else:
-                frames = ANIM_TILES.get(last_dir, [])
-                curr = frames[anim_i] if frames else IDLE_TILE
-
-        # 繪製遊戲畫面
+        # 繪製地圖和玩家
         screen.fill((0,0,0))
-        floor = object_pos.union({(tile_x, tile_y)})
+        floor = object_pos.union({(player_pos['x'], player_pos['y'])})
         for ry, row in enumerate(background):
             for rx, tid in enumerate(row):
-                use = "000" if (rx,ry) in floor else tid
-                screen.blit(images[use], (rx*tile_size, (rows-1-ry)*tile_size))
+                use = '000' if (rx,ry) in floor else tid
+                screen.blit(images[use], (rx*tile_px, (rows-1-ry)*tile_px))
         for o in objects:
-            screen.blit(images[o['type']], (o['x']*tile_size, (rows-1-o['y'])*tile_size))
-        screen.blit(images[curr], (px, py))
+            screen.blit(images[o['type']], (o['x']*tile_px, (rows-1-o['y'])*tile_px))
+        # 玩家待機貼圖
+        screen.blit(images[IDLE_TILE], (player_pos['x']*tile_px, (rows-1-player_pos['y'])*tile_px))
 
         # 繪製 UI 區域
         pygame.draw.rect(screen, (50,50,50), (0, screen_h-UI_HEIGHT, screen_w, UI_HEIGHT))
@@ -203,13 +189,11 @@ def main():
         text_surf = font.render(input_text, True, (0,0,0))
         screen.blit(text_surf, (input_rect.x+5, input_rect.y+5))
         pygame.draw.rect(screen, BUTTON_COLOR, button_rect)
-        btn = font.render('Send', True, BUTTON_TEXT_COLOR)
-        bx = button_rect.x + (BUTTON_WIDTH-btn.get_width())//2
-        by = button_rect.y + (BUTTON_HEIGHT-btn.get_height())//2
-        screen.blit(btn, (bx, by))
-
+        btn_surf = font.render('Send', True, BUTTON_TEXT_COLOR)
+        screen.blit(btn_surf, (button_rect.x+(BUTTON_WIDTH-btn_surf.get_width())//2,
+                              button_rect.y+(BUTTON_HEIGHT-btn_surf.get_height())//2))
         pygame.display.flip()
- 
+
     pygame.quit()
     pygame.key.stop_text_input()
 
