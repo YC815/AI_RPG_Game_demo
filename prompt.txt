@@ -54,7 +54,7 @@
 ```json
 {
   "mode": "error",
-  "content": ""
+  "content": " <這裡寫報錯的原因> "
 }
 ```
 舉例：
