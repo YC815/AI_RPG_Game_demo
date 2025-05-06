@@ -14,6 +14,7 @@ import os
 import collections
 import re
 import openai
+import random  # 用於隨機生成玩家初始位置
 
 # 載入 Prompt
 with open("prompt.txt", "r", encoding="utf-8") as pf:
@@ -57,8 +58,22 @@ BUBBLE_FONT_NAME = FONT_NAME  # 或字體名稱，如 "Microsoft JhengHei"
 
 IGNORE_RE = re.compile(r"^\s*$")
 
-# 呼叫 LLM
+# 呼叫 LLM (結構化解析回傳)
+from pydantic import BaseModel
+from typing import List, Optional, Literal
+
+class MoveStep(BaseModel):
+    dir: Literal["up", "down", "left", "right"]
+    times: int
+
+class ApiResponse(BaseModel):
+    mode: Literal["move", "talk", "error"]
+    steps: Optional[List[MoveStep]] = None
+    content: Optional[str] = None
+
+
 def call_openai(user_input, position, can_talk):
+    """呼叫 OpenAI，並回傳結構化 ApiResponse dict"""
     json_mode_instruction = "請僅回傳純 JSON 格式，勿額外說明或文字。"
     messages = [
         {"role":"system","content":PROMPT_TEMPLATE},
@@ -68,14 +83,18 @@ def call_openai(user_input, position, can_talk):
             f"\"can_talk\":{str(can_talk).lower()}}} {user_input}"
         )}
     ]
-    resp = client.chat.completions.create(model=MODEL, messages=messages)
-    raw_text = resp.choices[0].message.content
-    print("LLM 原始回傳內容：", raw_text)
-    text = re.sub(r"```(?:json)?", "", raw_text).strip()
-    try:
-        return json.loads(text)
-    except:
-        return {"mode":"error","content":text}
+    # 使用 parse 進行結構化
+    completion = client.beta.chat.completions.parse(
+        model=MODEL,
+        messages=messages,
+        response_format=ApiResponse
+    )
+    parsed: ApiResponse = completion.choices[0].message.parsed
+    # 印出結構化解析結果
+    print("API Parsed Response:", parsed.dict())
+    return parsed.dict()
+
+
 
 
 def main():
@@ -114,11 +133,18 @@ def main():
     for tid in ids:
         img = pygame.image.load(os.path.join("images",f"{tid}.png")).convert_alpha()
         images[tid] = pygame.transform.scale(img,(tile,tile))
-    lava_set = {(o['x'],o['y']) for o in objects if o['type']==LAVA_TILE}
-    obj_set = {(o['x'],o['y']) for o in objects}
+        # 解析 map.json 中 lava_block 為實際岩漿座標，阻擋玩家踏上
+    lava_positions = {(c['x'], c['y']) for c in data.get('lava_block', [])}
+    # 保留 obj_set 作為繪製地面參考
+    obj_set = {(o['x'], o['y']) for o in objects}
+    obj_set = {(o['x'], o['y']) for o in objects}
+    # 保留 obj_set 作為繪製地面參考
+    obj_set = {(o['x'], o['y']) for o in objects}
 
-    # 玩家初始位置與狀態
-    pos = {'x':1,'y':2}
+    # 玩家初始位置與狀態，隨機生成於 (0,0)~(4,6)，隨機生成於 (0,0)~(4,6)
+    start_x = random.randint(0, 4)
+    start_y = random.randint(0, 6)
+    pos = {'x': start_x, 'y': start_y}
     px = pos['x'] * tile
     py = (rows-1-pos['y']) * tile
     move_queue = collections.deque()
@@ -185,7 +211,8 @@ def main():
         if not moving and move_queue:
             dx,dy = move_queue.popleft()
             nx,ny = pos['x']+dx, pos['y']+dy
-            if 0<=nx<cols and 0<=ny<rows and (nx,ny) not in lava_set:
+            # 邊界檢查與岩漿阻擋
+            if 0<=nx<cols and 0<=ny<rows and (nx,ny) not in lava_positions:
                 pos['x'],pos['y']=nx,ny
                 target_px = nx*tile; target_py=(rows-1-ny)*tile
                 moving=True; last_dir=(dx,dy); anim_t=0; anim_i=0; idle_t=0
